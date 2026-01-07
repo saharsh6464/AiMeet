@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Record System Audio (Browser)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    body { margin: 2rem; }
+    h1 { font-size: 1.25rem; margin-bottom: .75rem; }
+    .row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+    button { padding: .65rem 1rem; border: 0; border-radius: .5rem; cursor: pointer; font-weight: 600; background: #111; color: #fff; }
+    button[disabled] { opacity: .6; cursor: not-allowed; }
+    .soft { background: #f3f3f3; color: #111; }
+    .badge { padding: .35rem .6rem; border-radius: .5rem; background: #e9e9e9; }
+    .timer { font-variant-numeric: tabular-nums; font-weight: 700; }
+    .hint { color: #666; font-size: .9rem; }
+    .out { margin-top: 1rem; display: grid; gap: .75rem; }
+    audio { width: 100%; }
+    .ok { color: #066a0a; }
+    .err { color: #b00020; }
+  </style>
+</head>
+<body>
+  <h1>🔊 Record <em>system / tab</em> audio</h1>
+  <div class="row">
+    <button id="btnStart">Start (pick screen/tab & share audio)</button>
+    <button id="btnStop" class="soft" disabled>Stop</button>
+    <span class="badge">Status: <strong id="status">idle</strong></span>
+    <span class="badge timer" id="timer">00:00</span>
+  </div>
+
+  <div class="out" id="output" hidden>
+    <audio id="player" controls></audio>
+    <div class="row">
+      <a id="download" download="system-audio.webm"><button>Download</button></a>
+      <span id="filesize" class="hint"></span>
+    </div>
+    <div class="row">
+      <button id="btnUpload" class="soft">Upload (optional)</button>
+      <span id="uploadStatus" class="hint"></span>
+    </div>
+    <details>
+      <summary>Tips & debug</summary>
+      <div class="hint">
+        • On Chrome/Edge: pick a <b>tab</b> and check <b>Share tab audio</b> in the picker.<br>
+        • On Windows you can share entire screen with “Share system audio”. macOS needs extra OS permissions for screen capture.<br>
+        • If you hear echo, mute the shared tab’s output or keep this page in a different tab from the sound source.<br>
+      </div>
+      <pre id="log" style="white-space:pre-wrap;color:#444;"></pre>
+    </details>
+  </div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const btnStart = $("btnStart");
+  const btnStop = $("btnStop");
+  const statusEl = $("status");
+  const timerEl = $("timer");
+  const output = $("output");
+  const player = $("player");
+  const aDownload = $("download");
+  const fileSizeEl = $("filesize");
+  const uploadBtn = $("btnUpload");
+  const uploadStatus = $("uploadStatus");
+  const logEl = $("log");
+
+  let mediaRecorder = null;
+  let chunks = [];
+  let startTime = 0;
+  let tickHandle = null;
+  let lastBlob = null;
+  let mimeTypeChosen = "";
+
+  function log(...args){ logEl.textContent += args.join(" ") + "\n"; console.log(...args); }
+  function setStatus(s){ statusEl.textContent = s; }
+  function fmt(ms){ const t=Math.floor(ms/1000); return String(Math.floor(t/60)).padStart(2,"0")+":"+String(t%60).padStart(2,"0"); }
+  function startTimer(){ startTime=performance.now(); timerEl.textContent="00:00"; tickHandle=setInterval(()=>timerEl.textContent=fmt(performance.now()-startTime),200); }
+  function stopTimer(){ clearInterval(tickHandle); tickHandle=null; }
+
+  function pickMime(){
+    const types=[
+      "audio/webm;codecs=opus",
+      "audio/webm",
+      "audio/ogg;codecs=opus",
+      "audio/ogg",
+      "audio/mp4"
+    ];
+    for(const t of types){ if(MediaRecorder.isTypeSupported?.(t)) return t; }
+    return "";
+  }
+
+  async function startCapture() {
+    try {
+      btnStart.disabled = true; btnStop.disabled = true; setStatus("requesting-capture");
+
+      // Ask to capture a display surface (tab/window/screen) WITH audio.
+      // In the picker, you must check "Share {tab/system} audio".
+      const displayStream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,               // required by spec; we won't record the video track
+        audio: true                // key: enables system/tab audio option in picker
+        // Some browsers support extra hints like: audio: { systemAudio: "include", selfBrowserSurface: "exclude" }
+      });
+
+      // We’ll strip the video track so we only record audio.
+      const audioTracks = displayStream.getAudioTracks();
+      if (audioTracks.length === 0) {
+        setStatus("no-audio");
+        btnStart.disabled = false;
+        log("No system audio track available — ensure you checked 'Share audio' and selected a source that has audio.");
+        alert("No system audio track was provided. In the picker, select a TAB (with sound) and check 'Share tab audio'.");
+        // stop any tracks to turn off capture
+        displayStream.getTracks().forEach(t=>t.stop());
+        return;
+      }
+      const systemAudioStream = new MediaStream([audioTracks[0]]);
+
+      // If the user stops sharing from the browser UI, stop cleanly.
+      displayStream.getVideoTracks()[0]?.addEventListener("ended", () => {
+        if (mediaRecorder && mediaRecorder.state === "recording") stopRecording();
+      });
+
+      chunks = [];
+      mimeTypeChosen = pickMime();
+      log("Using MIME type:", mimeTypeChosen || "(browser default)");
+      mediaRecorder = new MediaRecorder(systemAudioStream, mimeTypeChosen ? { mimeType: mimeTypeChosen } : {});
+      mediaRecorder.addEventListener("dataavailable", e => { if (e.data && e.data.size > 0) chunks.push(e.data); });
+      mediaRecorder.addEventListener("stop", onStop);
+
+      setStatus("recording");
+      mediaRecorder.start(250);
+      startTimer();
+      btnStop.disabled = false;
+
+    } catch (err) {
+      setStatus("error");
+      btnStart.disabled = false;
+      log("Error starting capture:", err);
+      alert("Could not start system audio capture:\n" + (err.message || err));
+    }
+  }
+
+  function stopRecording() {
+    if (!mediaRecorder) return;
+    btnStop.disabled = true;
+    setStatus("stopping");
+    mediaRecorder.stop();
+    // Also stop the underlying tracks
+    try { mediaRecorder.stream.getTracks().forEach(t=>t.stop()); } catch {}
+    // Stopping the display stream’s video track is handled by the 'ended' above or the user’s picker UI
+    mediaRecorder = null;
+  }
+
+  async function onStop() {
+    stopTimer();
+    setStatus("processing");
+    try {
+      const type = mimeTypeChosen || (chunks[0]?.type || "audio/webm");
+      lastBlob = new Blob(chunks, { type });
+      const url = URL.createObjectURL(lastBlob);
+      player.src = url;
+      player.load();
+
+      const ext = type.includes("ogg") ? "ogg" : type.includes("mp4") ? "mp4" : "webm";
+      const filename = `system-audio_${new Date().toISOString().replace(/[:.]/g,"-")}.${ext}`;
+      aDownload.download = filename;
+      aDownload.href = url;
+      fileSizeEl.textContent = `Size: ${(lastBlob.size/1024).toFixed(1)} KB • Type: ${type}`;
+      output.hidden = false;
+
+      setStatus("ready");
+    } catch (e) {
+      setStatus("error");
+      log("Finalize error:", e);
+      alert("Error finalizing recording: " + (e.message || e));
+    }
+  }
+
+  async function uploadBlob() {
+    if (!lastBlob) { uploadStatus.textContent = "Nothing to upload."; return; }
+    uploadStatus.textContent = "Uploading…"; uploadStatus.className = "hint";
+    try {
+      const UPLOAD_URL = "/upload"; // change to your endpoint
+      const form = new FormData();
+      form.append("file", lastBlob, aDownload.download || "system-audio.webm");
+      const res = await fetch(UPLOAD_URL, { method: "POST", body: form });
+      if (!res.ok) throw new Error(`Server responded ${res.status}`);
+      const text = await res.text().catch(()=> "");
+      uploadStatus.textContent = "Upload complete ✔ " + (text ? `Server said: ${text}` : "");
+      uploadStatus.className = "hint ok";
+    } catch (e) {
+      uploadStatus.textContent = "Upload failed: " + (e.message || e);
+      uploadStatus.className = "hint err";
+    }
+  }
+
+  btnStart.addEventListener("click", startCapture);
+  btnStop.addEventListener("click", stopRecording);
+  uploadBtn.addEventListener("click", uploadBlob);
+
+  if (!navigator.mediaDevices?.getDisplayMedia) {
+    setStatus("unsupported");
+    btnStart.disabled = true;
+    alert("Your browser does not support getDisplayMedia(). Use a recent Chrome/Edge on desktop.");
+  }
+})();
+</script>
+</body>
+</html>
